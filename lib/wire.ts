@@ -86,14 +86,20 @@ function partOf(block: Json): Json | null {
   return null;
 }
 
-/** A tool_result block's content as text: its text blocks, or its JSON when it holds something else. */
-function toolResultText(content: unknown): string {
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    const text = textOf(content);
-    return text !== '' ? text : JSON.stringify(content);
-  }
-  return content === undefined ? '' : JSON.stringify(content);
+/**
+ * A tool_result block's content as text: its text blocks, or its JSON when it holds something else.
+ * A failed result (is_error) is marked as one, so the model reads it as a failure, not a success:
+ * the Anthropic wire carries the flag, and the Chat Completions translation has no other place for it.
+ */
+function toolResultText(block: Json): string {
+  const content = block.content;
+  let text: string;
+  if (typeof content === 'string') text = content;
+  else if (Array.isArray(content)) {
+    const inner = textOf(content);
+    text = inner !== '' ? inner : JSON.stringify(content);
+  } else text = content === undefined ? '' : JSON.stringify(content);
+  return block.is_error === true && text !== '' ? `Error: ${text}` : text;
 }
 
 /** A tool call's arguments as an object: the gateway's JSON string, or {} when it is not one. */
@@ -166,7 +172,7 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
         messages.push({
           role: 'tool',
           tool_call_id: typeof block.tool_use_id === 'string' ? block.tool_use_id : '',
-          content: toolResultText(block.content),
+          content: toolResultText(block),
         });
         continue;
       }
@@ -361,7 +367,9 @@ export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8A
     finished = true;
     return [
       ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
+      // Anthropic's message_delta usage carries both counts; the input count is known by now, from
+      // the usage chunk that arrived with the stream's last chunk.
+      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } }),
       sseEvent('message_stop', { type: 'message_stop' }),
     ];
   };

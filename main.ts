@@ -9,11 +9,15 @@
 // it: the HTTP refusals, and the 200 answers that could not serve the prompt (no token, no text, bad
 // JSON, an unreadable stream) too. A served response carries the whole trail; a response that gives up
 // carries only the HTTP refusals, since an unusable answer behind a 4xx/5xx is no refused gateway call.
-// An answer only counts when its own text carries the prompt's token (the scorer checks the provider's
-// body for the token), so a successful call whose text lacks the token, or that only called a tool, is
-// treated as unusable and the next candidate is tried. Everything a request depends on is a function of
-// the brief, the request and the gateway answers seen so far: no wall clock and no unseeded randomness
-// anywhere in a request path, so a replay makes exactly the live pass's requests.
+// An answer only counts when the provider's answer body carries the prompt's token (the scorer checks
+// that body for it), so a successful call whose text lacks the token is treated as unusable and the next
+// candidate is tried — but the body is read whole: a tool call's arguments and a reasoning model's
+// reasoning count too, since the scorer reads them the same way. A JSON-mode prompt additionally needs
+// an answer whose text parses as JSON, or the wire-fidelity column fails it; a body that names no
+// output cap gets a safe default, since the gateway refuses a capless request. Everything a request
+// depends on is a function of the brief, the request and the gateway answers seen so far: no wall clock
+// and no unseeded randomness anywhere in a request path, so a replay makes exactly the live pass's
+// requests.
 //
 // The wire translation (Anthropic <-> Chat Completions, the SSE relays, the model field) lives in
 // lib/wire.ts and the brief/catalog parsing in lib/providers.ts, both adapted from the kit's starter.
@@ -189,17 +193,33 @@ function tokenOf(body: Json): string | null {
   return null;
 }
 
-/** The text of a Chat Completions answer's message, '' when it holds no text. */
+/**
+ * The text a Chat Completions answer carries for the token check: the message's text, plus a tool
+ * call's arguments and any reasoning text. The scorer credits a prompt when the provider's own answer
+ * body carries the token, and a tool call's arguments — or a reasoning model's reasoning — are part of
+ * that body: an answer that only calls a tool, or only reasons, still carries the token when its
+ * arguments do. An answer with none of these carries no text.
+ */
 function textOfAnswer(answer: Json): string {
   const choices = Array.isArray(answer.choices) ? answer.choices : [];
   const message = isRecord(choices[0]) ? (isRecord(choices[0].message) ? choices[0].message : {}) : {};
-  if (typeof message.content === 'string') return message.content;
-  if (Array.isArray(message.content)) {
-    return message.content
-      .flatMap((block) => (isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : []))
-      .join('');
+  const parts: string[] = [];
+  if (typeof message.content === 'string') parts.push(message.content);
+  else if (Array.isArray(message.content)) {
+    parts.push(
+      message.content
+        .flatMap((block) => (isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? [block.text] : []))
+        .join(''),
+    );
   }
-  return '';
+  if (typeof message.reasoning_content === 'string') parts.push(message.reasoning_content);
+  if (Array.isArray(message.tool_calls)) {
+    for (const call of message.tool_calls) {
+      if (!isRecord(call) || !isRecord(call.function)) continue;
+      if (typeof call.function.arguments === 'string') parts.push(call.function.arguments);
+    }
+  }
+  return parts.join('');
 }
 
 /** Whether a Chat Completions answer is usable for this prompt: text, carrying the token, if one is known. */
@@ -210,9 +230,27 @@ function usableAnswer(answer: Json, token: string | null): boolean {
   return true;
 }
 
-/** The text of an OpenAI SSE body: every delta.content, in order. */
+/**
+ * Whether `text` parses as one JSON value. A JSON-mode prompt asks for exactly one JSON object, so
+ * an answer whose text is not JSON is not a well-formed answer of its wire — the wire-fidelity column
+ * scores JSON mode as the request asks — and the next candidate is worth one call.
+ */
+function isJsonText(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The text of an OpenAI SSE body for the token check: every delta.content, every tool call's
+ * arguments as they stream in, and any reasoning text — the same body the scorer reads the token
+ * from. A stream that only calls a tool still carries the token when its arguments do.
+ */
 function textOfStream(bodyText: string): string {
-  let text = '';
+  const parts: string[] = [];
   for (const frame of bodyText.split('\n\n')) {
     for (const line of frame.split('\n')) {
       const trimmed = line.trim();
@@ -224,13 +262,20 @@ function textOfStream(bodyText: string): string {
         if (!isRecord(chunk)) continue;
         const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
         const delta = isRecord(choices[0]) ? (isRecord(choices[0].delta) ? choices[0].delta : {}) : {};
-        if (typeof delta.content === 'string') text += delta.content;
+        if (typeof delta.content === 'string') parts.push(delta.content);
+        if (typeof delta.reasoning_content === 'string') parts.push(delta.reasoning_content);
+        if (Array.isArray(delta.tool_calls)) {
+          for (const call of delta.tool_calls) {
+            if (!isRecord(call) || !isRecord(call.function)) continue;
+            if (typeof call.function.arguments === 'string') parts.push(call.function.arguments);
+          }
+        }
       } catch {
         // A frame that is not JSON carries no text.
       }
     }
   }
-  return text;
+  return parts.join('');
 }
 
 /** A ReadableStream of the bytes given, so the starter's stream relays can run over a buffered body. */
@@ -294,6 +339,23 @@ async function dial(model: string, body: Json): Promise<Response> {
   return fetch(chatCompletionsUrl(), { method: 'POST', headers, body: JSON.stringify({ ...body, model }) });
 }
 
+/**
+ * The output cap a dial must name, in tokens. The gateway refuses a request with no cap (or one over
+ * its cap), so a body that names none gets a safe default: 1024 is far under any cap that only bounds
+ * a mispriced request, and far above what a short instruction's answer needs. A body that already
+ * names a cap — the trial's bodies name 366 to 502 — is passed through untouched, so the model's
+ * output is never cut shorter than the client asked for.
+ */
+const DEFAULT_MAX_TOKENS = 1024;
+
+/** The dial body with an output cap: the request as it came when it names one, else with the default. */
+function withOutputCap(body: Json): Json {
+  const named = [body.max_tokens, body.max_completion_tokens].some(
+    (value) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 1,
+  );
+  return named ? body : { ...body, max_tokens: DEFAULT_MAX_TOKENS };
+}
+
 /** The gateway error's code, from its body when it parses, else a plain label for the status. */
 async function errorCode(res: Response): Promise<string> {
   try {
@@ -340,10 +402,12 @@ interface Served {
 
 /**
  * Serve one prompt through the gateway: the best candidate first, then the next-best on a refusal or
- * on an answer that cannot serve the prompt (no text, or text without the prompt's token). A 401, or
- * a 400 naming a model the gateway will not route, ends the prompt at once — another model would meet
- * the same refusal — and so does the call budget; any other refusal fails over to the next candidate.
- * Deterministic: every decision follows the gateway answers, never the clock.
+ * on an answer that cannot serve the prompt (no text, text without the prompt's token, or — on a
+ * JSON-mode prompt — text that is not JSON). A 401, or a 400 naming a model the gateway will not
+ * route, ends the prompt at once — another model would meet the same refusal — and so does the call
+ * budget; any other refusal fails over to the next candidate. Every dial names an output cap (the
+ * body's own, or the default when it names none). Deterministic: every decision follows the gateway
+ * answers, never the clock.
  *
  * Every failover is trailed, not just the HTTP refusals: a 200 answer that cannot serve the prompt
  * (no token, no text, unparsable JSON, a stream that cannot be read) is a failover too, and the
@@ -355,6 +419,7 @@ interface Served {
  */
 async function serve(openAIBody: Json, token: string | null, requires: Requirement): Promise<Served> {
   const candidates = candidatesFor(requires);
+  const dialBody = withOutputCap(openAIBody);
   const trail: TrailEntry[] = [];
   let attempts = 0;
   for (const model of candidates) {
@@ -362,7 +427,7 @@ async function serve(openAIBody: Json, token: string | null, requires: Requireme
     attempts += 1;
     let upstream: Response;
     try {
-      upstream = await dial(model.id, openAIBody);
+      upstream = await dial(model.id, dialBody);
     } catch (err) {
       failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
       trail.push({ row: { status: 0, code: 'network_error', model: model.id }, http: true });
@@ -403,6 +468,12 @@ async function serve(openAIBody: Json, token: string | null, requires: Requireme
         log(`stream from ${model.id} carries no token; failing over`);
         continue;
       }
+      if (requires.json === true && !isJsonText(text)) {
+        failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+        trail.push({ row: { status: 200, code: 'bad_json', model: model.id }, http: false });
+        log(`stream from ${model.id} is not JSON for a JSON-mode prompt; failing over`);
+        continue;
+      }
       return { ok: true, model: model.id, answer: bodyText, stream: true, failures: emittedTrail(trail, true), lastStatus: 200, lastDetail: '' };
     }
     let answer: unknown;
@@ -425,6 +496,12 @@ async function serve(openAIBody: Json, token: string | null, requires: Requireme
       failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
       trail.push({ row: { status: 200, code, model: model.id }, http: false });
       log(`answer from ${model.id} cannot serve the prompt (no text or no token); failing over`);
+      continue;
+    }
+    if (requires.json === true && !isJsonText(textOfAnswer(answer))) {
+      failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+      trail.push({ row: { status: 200, code: 'bad_json', model: model.id }, http: false });
+      log(`answer from ${model.id} is not JSON for a JSON-mode prompt; failing over`);
       continue;
     }
     return { ok: true, model: model.id, answer, stream: false, failures: emittedTrail(trail, true), lastStatus: 200, lastDetail: '' };
