@@ -385,6 +385,17 @@ function retriable(status: number | null, code: string): boolean {
   return status === 429 || status >= 500;
 }
 
+/**
+ * Whether the model an answer names is the model that was dialled: the provider names it without
+ * the gateway's `openrouter/` prefix and without the `:free` suffix, so both are stripped before
+ * comparing. A different model means the provider substituted another one behind the gateway — the
+ * answer would be reported under the wrong model, so it cannot serve the prompt.
+ */
+function sameModel(named: string, dialled: string): boolean {
+  const strip = (id: string): string => id.replace(/^openrouter\//, '').replace(/:free$/, '');
+  return strip(named) === strip(dialled);
+}
+
 interface Served {
   ok: boolean;
   /** The model that served the prompt, when one did. */
@@ -502,6 +513,12 @@ async function serve(openAIBody: Json, token: string | null, requires: Requireme
       failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
       trail.push({ row: { status: 200, code: 'bad_json', model: model.id }, http: false });
       log(`answer from ${model.id} is not JSON for a JSON-mode prompt; failing over`);
+      continue;
+    }
+    if (typeof answer.model === 'string' && !sameModel(answer.model, model.id)) {
+      failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+      trail.push({ row: { status: 200, code: 'wrong_model', model: model.id }, http: false });
+      log(`answer from ${model.id} names another model (${answer.model}); failing over`);
       continue;
     }
     return { ok: true, model: model.id, answer, stream: false, failures: emittedTrail(trail, true), lastStatus: 200, lastDetail: '' };
