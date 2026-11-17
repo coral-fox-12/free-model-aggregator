@@ -238,9 +238,20 @@ export function readBrief(path: string): Brief {
   return { models, prompts, error: null };
 }
 
-/** The models this entry may serve: the brief's free ones, in the brief's order. */
+/**
+ * The models this entry may serve: the brief's free ones, in the brief's order, each id once. A
+ * brief that repeats a row must not list the id twice — the catalog column counts each id once, and
+ * a repeated candidate would spend a second dial on a model already tried. This is the same set
+ * buildCatalog registers, by construction: one deduped list feeds the catalog, the model listings
+ * and the candidates alike.
+ */
 export function freeModels(brief: Brief): ModelRow[] {
-  return brief.models.filter((m) => m.free);
+  const seen = new Set<string>();
+  return brief.models.filter((m) => {
+    if (!m.free || seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
 }
 
 /** What a model can do, as the brief's row says it. */

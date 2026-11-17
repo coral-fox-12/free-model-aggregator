@@ -5,12 +5,15 @@
 // the best model for a plain prompt is thinkingmachines/inkling-2-small (1475), for a JSON-mode prompt
 // nvidia/nemotron-3.5-super-vl (1303, the best JSON-capable one), for a tools prompt inkling again.
 // When a gateway call is refused (429/5xx/network), the next-best candidate serves the prompt instead,
-// and the refusal trail goes out on the x-makefun-upstream-failures header so the failover column can
-// see it. An answer only counts when its own text carries the prompt's token (the scorer checks the
-// provider's body for the token), so a successful call whose text lacks the token, or that only called
-// a tool, is treated as unusable and the next candidate is tried. Everything a request depends on is
-// a function of the brief, the request and the gateway answers seen so far: no wall clock and no
-// unseeded randomness anywhere in a request path, so a replay makes exactly the live pass's requests.
+// and every failover goes out on the x-makefun-upstream-failures header so the failover column can see
+// it: the HTTP refusals, and the 200 answers that could not serve the prompt (no token, no text, bad
+// JSON, an unreadable stream) too. A served response carries the whole trail; a response that gives up
+// carries only the HTTP refusals, since an unusable answer behind a 4xx/5xx is no refused gateway call.
+// An answer only counts when its own text carries the prompt's token (the scorer checks the provider's
+// body for the token), so a successful call whose text lacks the token, or that only called a tool, is
+// treated as unusable and the next candidate is tried. Everything a request depends on is a function of
+// the brief, the request and the gateway answers seen so far: no wall clock and no unseeded randomness
+// anywhere in a request path, so a replay makes exactly the live pass's requests.
 //
 // The wire translation (Anthropic <-> Chat Completions, the SSE relays, the model field) lives in
 // lib/wire.ts and the brief/catalog parsing in lib/providers.ts, both adapted from the kit's starter.
@@ -47,8 +50,13 @@ const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 /** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** The most gateway calls one prompt may spend, across retries and failovers. */
-const MAX_ATTEMPTS_PER_PROMPT = 6;
+/**
+ * The most gateway calls one prompt may spend, across retries and failovers. Six prompts at eight
+ * attempts is 48 calls, inside the 54-call guard and the trial's 60-call cap, so a prompt whose first
+ * models all refuse still gets two more candidates than it did at six — and a prompt that cannot be
+ * served still costs at most eight, never the trial.
+ */
+const MAX_ATTEMPTS_PER_PROMPT = 8;
 /** The trial's gateway call cap is 60; stop starting new attempts before it is near. */
 const CALL_BUDGET_GUARD = 54;
 /** A refusal trail row. */
@@ -56,6 +64,32 @@ interface FailureRow {
   status: number;
   code: string;
   model: string | null;
+}
+
+/**
+ * One failover on the way to an answer, in the order it happened. `http` marks a refused gateway
+ * call (a 429/5xx/network error, or a terminal 400/401); an unusable 200 answer — no token, no text,
+ * unparsable JSON, an unreadable stream — is a failover of the other kind: the gateway call succeeded
+ * and its body could not serve the prompt. The header's rows are FailureRows either way; the kind
+ * only decides which rows a response that gives up may carry (see emittedTrail).
+ */
+interface TrailEntry {
+  row: FailureRow;
+  http: boolean;
+}
+
+/**
+ * The trail rows a response carries, at most 8, in the order the calls failed. A served response
+ * carries the whole trail — the failover column can only see a recovered refusal through it. A
+ * response that gives up carries only the HTTP refusals: the env already records its 4xx/5xx, and
+ * an unusable answer behind it is no refused gateway call, so trailing it would invent a refusal
+ * the trial's gateway record does not hold.
+ */
+function emittedTrail(trail: TrailEntry[], served: boolean): FailureRow[] {
+  return trail
+    .filter((entry) => served || entry.http)
+    .map((entry) => entry.row)
+    .slice(0, 8);
 }
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
@@ -127,19 +161,32 @@ function requirementsFromBody(body: Json): Requirement {
   return { tools: Array.isArray(body.tools) && body.tools.length > 0, vision, json: format === 'json_object' || format === 'json_schema' };
 }
 
-/** The prompt's token, read from the request itself: the unique WORD-1234 the instruction carries. */
+/**
+ * The prompt's token, read from the request itself: the unique WORD-1234 the instruction carries.
+ * The token lives in the instruction, a user message — so user-message text is searched first and
+ * everything else (system prompt, tool definitions, prior turns) only after it. A WORD-1234 pattern
+ * anywhere else — a date, an id, a quoted example — must never win over the instruction's own token:
+ * the wrong token fails every candidate, since no model can echo a token the instruction never had.
+ */
 function tokenOf(body: Json): string | null {
-  const texts: string[] = [];
-  const collect = (value: unknown): void => {
-    if (typeof value === 'string') texts.push(value);
-    else if (Array.isArray(value)) value.forEach(collect);
-    else if (isRecord(value)) Object.values(value).forEach(collect);
+  const pattern = /[A-Z]{2,}-[0-9]{4}/;
+  const userTexts: string[] = [];
+  const otherTexts: string[] = [];
+  const collect = (value: unknown, user: boolean): void => {
+    if (typeof value === 'string') (user ? userTexts : otherTexts).push(value);
+    else if (Array.isArray(value)) value.forEach((item) => collect(item, user));
+    else if (isRecord(value)) {
+      const isUser = value.role === 'user';
+      Object.values(value).forEach((item) => collect(item, user || isUser));
+    }
   };
-  collect(body.messages ?? body.content ?? []);
-  collect(body.system);
-  const joined = texts.join('\n');
-  const match = /[A-Z]{2,}-[0-9]{4}/.exec(joined);
-  return match === null ? null : match[0];
+  collect(body.messages ?? body.content ?? [], false);
+  collect(body.system, false);
+  for (const text of [...userTexts, ...otherTexts]) {
+    const match = pattern.exec(text);
+    if (match !== null) return match[0];
+  }
+  return null;
 }
 
 /** The text of a Chat Completions answer's message, '' when it holds no text. */
@@ -261,9 +308,18 @@ async function errorCode(res: Response): Promise<string> {
   }
 }
 
-/** Whether a refused gateway call is worth another candidate: 429/5xx/network, never 400/401. */
-function retriable(status: number | null): boolean {
+/**
+ * Whether a refused gateway call is worth another candidate. A 429/5xx/network refusal is: the next
+ * model may serve. A 401 is not — the key is the problem, and every model would meet the same
+ * refusal. A 400 is not when the gateway names a model it will not route (`model_not_allowed`: this
+ * entry only dials free models, so that refusal is about the request, not the model); any other 400
+ * may be the model — a model that will not take `response_format` or `tools`, say — so the next
+ * candidate is worth one call. The attempt and call budgets still bound the cost.
+ */
+function retriable(status: number | null, code: string): boolean {
   if (status === null) return true;
+  if (status === 401) return false;
+  if (status === 400) return code !== 'model_not_allowed';
   return status === 429 || status >= 500;
 }
 
@@ -275,7 +331,7 @@ interface Served {
   answer: Json | string | null;
   /** The stream flag the upstream answer came with. */
   stream: boolean;
-  /** Every refusal on the way here, for the trail header. */
+  /** The trail rows this response carries: every failover when served, the HTTP refusals when not. */
   failures: FailureRow[];
   /** The last refusal's status, for the error when nothing served. */
   lastStatus: number;
@@ -284,13 +340,22 @@ interface Served {
 
 /**
  * Serve one prompt through the gateway: the best candidate first, then the next-best on a refusal or
- * on an answer that cannot serve the prompt (no text, or text without the prompt's token). A 400/401
- * ends the prompt at once — another model would meet the same refusal — and so does the call budget.
+ * on an answer that cannot serve the prompt (no text, or text without the prompt's token). A 401, or
+ * a 400 naming a model the gateway will not route, ends the prompt at once — another model would meet
+ * the same refusal — and so does the call budget; any other refusal fails over to the next candidate.
  * Deterministic: every decision follows the gateway answers, never the clock.
+ *
+ * Every failover is trailed, not just the HTTP refusals: a 200 answer that cannot serve the prompt
+ * (no token, no text, unparsable JSON, a stream that cannot be read) is a failover too, and the
+ * failover column can only see a recovered refusal through the trail header. A served response
+ * carries the whole trail; a response that gives up carries only the HTTP refusals — the env already
+ * records its 4xx/5xx, and an unusable answer behind it is no refused gateway call, so trailing it
+ * would invent a refusal the record does not hold. A gateway answer that is not JSON at all used to
+ * throw out of here and lose the prompt with a 500; it is a failover like any other unusable answer.
  */
 async function serve(openAIBody: Json, token: string | null, requires: Requirement): Promise<Served> {
   const candidates = candidatesFor(requires);
-  const failures: FailureRow[] = [];
+  const trail: TrailEntry[] = [];
   let attempts = 0;
   for (const model of candidates) {
     if (attempts >= MAX_ATTEMPTS_PER_PROMPT || callsMade >= CALL_BUDGET_GUARD) break;
@@ -300,7 +365,7 @@ async function serve(openAIBody: Json, token: string | null, requires: Requireme
       upstream = await dial(model.id, openAIBody);
     } catch (err) {
       failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
-      failures.push({ status: 0, code: 'network_error', model: model.id });
+      trail.push({ row: { status: 0, code: 'network_error', model: model.id }, http: true });
       log(`dial ${model.id} failed to reach the gateway: ${(err as Error).message}`);
       continue;
     }
@@ -308,52 +373,80 @@ async function serve(openAIBody: Json, token: string | null, requires: Requireme
       const status = upstream.status;
       const code = await errorCode(upstream);
       failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
-      failures.push({ status, code, model: model.id });
+      trail.push({ row: { status, code, model: model.id }, http: true });
       log(`dial ${model.id} refused HTTP ${status} (${code})`);
-      if (!retriable(status)) {
-        return { ok: false, model: null, answer: null, stream: false, failures, lastStatus: status, lastDetail: code };
+      if (!retriable(status, code)) {
+        return { ok: false, model: null, answer: null, stream: false, failures: emittedTrail(trail, false), lastStatus: status, lastDetail: code };
       }
       continue;
     }
     if (openAIBody.stream === true) {
-      const bodyText = await upstream.text();
-      const text = textOfStream(bodyText);
-      if (token !== null && !text.includes(token)) {
-        log(`stream from ${model.id} carries no token; failing over`);
+      let bodyText: string;
+      try {
+        bodyText = await upstream.text();
+      } catch (err) {
+        failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+        trail.push({ row: { status: 200, code: 'stream_error', model: model.id }, http: false });
+        log(`stream from ${model.id} could not be read: ${(err as Error).message}; failing over`);
         continue;
       }
-      if (text === '' && token !== null) {
+      const text = textOfStream(bodyText);
+      if (text === '') {
+        failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+        trail.push({ row: { status: 200, code: 'empty_answer', model: model.id }, http: false });
         log(`stream from ${model.id} carries no text; failing over`);
         continue;
       }
-      return { ok: true, model: model.id, answer: bodyText, stream: true, failures, lastStatus: 200, lastDetail: '' };
+      if (token !== null && !text.includes(token)) {
+        failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+        trail.push({ row: { status: 200, code: 'no_token', model: model.id }, http: false });
+        log(`stream from ${model.id} carries no token; failing over`);
+        continue;
+      }
+      return { ok: true, model: model.id, answer: bodyText, stream: true, failures: emittedTrail(trail, true), lastStatus: 200, lastDetail: '' };
     }
-    const answer: unknown = await upstream.json();
+    let answer: unknown;
+    try {
+      answer = await upstream.json();
+    } catch {
+      failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+      trail.push({ row: { status: 200, code: 'invalid_json', model: model.id }, http: false });
+      log(`answer from ${model.id} is not JSON; failing over`);
+      continue;
+    }
     if (!isRecord(answer)) {
+      failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+      trail.push({ row: { status: 200, code: 'not_object', model: model.id }, http: false });
       log(`answer from ${model.id} is not one JSON object; failing over`);
       continue;
     }
     if (!usableAnswer(answer, token)) {
+      const code = textOfAnswer(answer) === '' ? 'empty_answer' : 'no_token';
+      failureCounts.set(model.id, (failureCounts.get(model.id) ?? 0) + 1);
+      trail.push({ row: { status: 200, code, model: model.id }, http: false });
       log(`answer from ${model.id} cannot serve the prompt (no text or no token); failing over`);
       continue;
     }
-    return { ok: true, model: model.id, answer, stream: false, failures, lastStatus: 200, lastDetail: '' };
+    return { ok: true, model: model.id, answer, stream: false, failures: emittedTrail(trail, true), lastStatus: 200, lastDetail: '' };
   }
-  const last = failures[failures.length - 1];
+  const lastHttp = trail.filter((entry) => entry.http).map((entry) => entry.row).pop();
   return {
     ok: false,
     model: null,
     answer: null,
     stream: false,
-    failures,
-    lastStatus: last?.status ?? 502,
-    lastDetail: last?.code ?? 'no_free_model',
+    failures: emittedTrail(trail, false),
+    lastStatus: lastHttp?.status ?? 502,
+    lastDetail: lastHttp?.code ?? (trail.length === 0 ? 'no_free_model' : 'no_usable_answer'),
   };
 }
 
 /** A refusal as a 502 in the client's wire, with the trail header when there is one. */
 function refused(res: ServerResponse, wire: 'openai' | 'anthropic', served: Served): void {
-  const detail = `the gateway answered HTTP ${served.lastStatus}${served.lastDetail === '' ? '' : ` (${served.lastDetail})`}`;
+  const detail =
+    served.lastStatus === 0
+      ? `the gateway could not be reached${served.lastDetail === '' ? '' : ` (${served.lastDetail})`}`
+      : `the gateway answered HTTP ${served.lastStatus}${served.lastDetail === '' ? '' : ` (${served.lastDetail})`}`;
   if (wire === 'anthropic') sendError(res, wire, 502, 'api_error', detail, served.failures);
   else sendError(res, wire, 502, 'upstream_error', detail, served.failures);
 }

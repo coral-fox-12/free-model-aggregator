@@ -201,6 +201,7 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   if (isRecord(choice)) {
     if (choice.type === 'auto') out.tool_choice = 'auto';
     else if (choice.type === 'any') out.tool_choice = 'required';
+    else if (choice.type === 'none') out.tool_choice = 'none';
     else if (choice.type === 'tool' && typeof choice.name === 'string') out.tool_choice = { type: 'function', function: { name: choice.name } };
   }
   if (body.stream === true) {
